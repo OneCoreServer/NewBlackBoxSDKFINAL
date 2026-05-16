@@ -13,7 +13,9 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.provider.Settings;
+import android.system.Os;
 import android.view.Gravity;
 import android.view.View;
 import android.view.animation.AlphaAnimation;
@@ -30,7 +32,9 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.res.ResourcesCompat;
 
 import com.onecore.loader.R;
+import com.onecore.loader.BoxApplication;
 import com.onecore.loader.utils.FLog;
+import com.topjohnwu.superuser.Shell;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -93,6 +97,11 @@ public class FileCopyTask {
         return new File(base, "Android/obb/" + packageName);
     }
 
+
+    private File getTertiaryFallbackObbDir(String packageName) {
+        return new File(activity.getCacheDir(), "virtual_storage/Android/obb/" + packageName);
+    }
+
     private File getFallbackDataDir(String packageName) {
         File base = new File(activity.getFilesDir(), "virtual_storage");
         return new File(base, "Android/data/" + packageName);
@@ -104,40 +113,121 @@ public class FileCopyTask {
         return new File(base, "Android/data/" + packageName);
     }
 
-    private boolean ensureDir(File dir) {
-        if (dir == null) return false;
-        if (dir.exists()) {
-            if (dir.isDirectory()) return true;
-            if (!dir.delete()) return false;
-        }
-        return dir.mkdirs();
+
+    private File getTertiaryFallbackDataDir(String packageName) {
+        return new File(activity.getCacheDir(), "virtual_storage/Android/data/" + packageName);
     }
 
-    private File resolveWritableDir(File primary, File fallback, File secondaryFallback, String type, String packageName) {
-        if (ensureDir(primary)) {
-            return primary;
+    private boolean ensureDir(File dir) {
+        if (dir == null) return false;
+        try {
+            if (dir.exists()) {
+                if (!dir.isDirectory()) {
+                    if (!dir.delete()) return false;
+                } else {
+                    ensureDirectoryPermissions(dir);
+                    return dir.canWrite();
+                }
+            }
+            boolean created = dir.mkdirs();
+            if (!created && !dir.exists()) {
+                return false;
+            }
+            ensureDirectoryPermissions(dir);
+            return dir.exists() && dir.isDirectory() && dir.canWrite();
+        } catch (SecurityException e) {
+            FLog.warning("[DIR] security exception path=" + dir.getAbsolutePath() + ", error=" + e.getMessage());
+            return false;
+        } catch (Throwable e) {
+            FLog.warning("[DIR] exception path=" + dir.getAbsolutePath() + ", error=" + e.getMessage());
+            return false;
         }
-        if (primary != null) {
-            FLog.warning("[" + type + "] primary dir create failed package=" + packageName + ", path=" + primary.getAbsolutePath());
-        }
+    }
 
-        if (ensureDir(fallback)) {
-            FLog.info("[" + type + "] using fallback dir package=" + packageName + ", path=" + fallback.getAbsolutePath());
-            return fallback;
+    private void ensureDirectoryPermissions(File dir) {
+        if (dir == null) return;
+        try {
+            dir.setReadable(true, false);
+            dir.setWritable(true, false);
+            dir.setExecutable(true, false);
+        } catch (SecurityException ignored) {
         }
-        if (fallback != null) {
-            FLog.warning("[" + type + "] fallback dir create failed package=" + packageName + ", path=" + fallback.getAbsolutePath());
-        }
+    }
 
-        if (ensureDir(secondaryFallback)) {
-            FLog.info("[" + type + "] using secondary fallback dir package=" + packageName + ", path=" + secondaryFallback.getAbsolutePath());
-            return secondaryFallback;
+    private File resolveWritableDir(String type, String packageName, File... candidates) {
+        for (int index = 0; index < candidates.length; index++) {
+            File candidate = candidates[index];
+            if (candidate == null) {
+                continue;
+            }
+            if (ensureDir(candidate)) {
+                if (index == 0) {
+                    FLog.info("[" + type + "] using primary dir package=" + packageName + ", path=" + candidate.getAbsolutePath());
+                } else {
+                    FLog.info("[" + type + "] using fallback #" + index + " package=" + packageName + ", path=" + candidate.getAbsolutePath());
+                }
+                return candidate;
+            }
+            if (index == 0) {
+                FLog.warning("[" + type + "] primary dir create failed package=" + packageName + ", path=" + candidate.getAbsolutePath());
+            } else {
+                FLog.warning("[" + type + "] fallback #" + index + " dir create failed package=" + packageName + ", path=" + candidate.getAbsolutePath());
+            }
         }
-        if (secondaryFallback != null) {
-            FLog.error("[" + type + "] secondary fallback dir create failed package=" + packageName + ", path=" + secondaryFallback.getAbsolutePath());
+        File last = candidates.length > 0 ? candidates[candidates.length - 1] : null;
+        if (tryCreateWithRoot(last, type, packageName)) {
+            return last;
         }
-
+        File virtualLink = type.equals("OBB") ? getFallbackObbDir(packageName) : getFallbackDataDir(packageName);
+        if (virtualLink != null && tryCreateSymlinkFallback(type, packageName, virtualLink)) {
+            return virtualLink;
+        }
+        FLog.error("[" + type + "] all directory candidates failed package=" + packageName);
         return null;
+    }
+
+
+    private void logStorageDiagnostics(String packageName) {
+        boolean filesWritable = activity.getFilesDir() != null && activity.getFilesDir().canWrite();
+        boolean cacheWritable = activity.getCacheDir() != null && activity.getCacheDir().canWrite();
+        File externalRoot = Environment.getExternalStorageDirectory();
+        boolean externalWritable = externalRoot != null && externalRoot.canWrite();
+        long filesFree = activity.getFilesDir() != null ? activity.getFilesDir().getUsableSpace() : -1L;
+        long cacheFree = activity.getCacheDir() != null ? activity.getCacheDir().getUsableSpace() : -1L;
+        long extFree = externalRoot != null ? externalRoot.getUsableSpace() : -1L;
+        boolean allFilesGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager();
+        FLog.info("[DIAG] package=" + packageName + ", uid=" + Process.myUid() + ", sdk=" + Build.VERSION.SDK_INT + ", filesWritable=" + filesWritable + ", cacheWritable=" + cacheWritable + ", externalWritable=" + externalWritable + ", allFilesGranted=" + allFilesGranted + ", filesFree=" + filesFree + ", cacheFree=" + cacheFree + ", extFree=" + extFree);
+    }
+
+    private boolean tryCreateWithRoot(File dir, String type, String packageName) {
+        if (dir == null || !BoxApplication.checkRootAccess()) return false;
+        try {
+            String path = dir.getAbsolutePath().replace(" ", "\\ ");
+            Shell.Result result = Shell.su("mkdir -p " + path, "chmod 777 " + path).exec();
+            boolean ok = result.isSuccess() && dir.exists() && dir.canWrite();
+            FLog.info("[" + type + "] root mkdir package=" + packageName + ", path=" + dir.getAbsolutePath() + ", success=" + ok);
+            return ok;
+        } catch (Throwable e) {
+            FLog.warning("[" + type + "] root mkdir failed package=" + packageName + ", path=" + dir.getAbsolutePath() + ", error=" + e.getMessage());
+            return false;
+        }
+    }
+
+    private boolean tryCreateSymlinkFallback(String type, String packageName, File targetVirtualPath) {
+        try {
+            File realPath = new File(activity.getFilesDir(), "game_data/" + type.toLowerCase(Locale.US) + "/" + packageName);
+            if (!ensureDir(realPath)) return false;
+            File parent = targetVirtualPath != null ? targetVirtualPath.getParentFile() : null;
+            if (!ensureDir(parent)) return false;
+            if (targetVirtualPath.exists()) return targetVirtualPath.canWrite();
+            Os.symlink(realPath.getAbsolutePath(), targetVirtualPath.getAbsolutePath());
+            boolean linked = targetVirtualPath.exists();
+            FLog.info("[" + type + "] symlink fallback package=" + packageName + ", virtual=" + targetVirtualPath.getAbsolutePath() + ", real=" + realPath.getAbsolutePath() + ", success=" + linked);
+            return linked;
+        } catch (Throwable e) {
+            FLog.warning("[" + type + "] symlink fallback failed package=" + packageName + ", error=" + e.getMessage());
+            return false;
+        }
     }
 
     public boolean isObbCopied(String packageName) {
@@ -180,7 +270,12 @@ public class FileCopyTask {
                 Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
                 Uri uri = Uri.fromParts("package", activity.getPackageName(), null);
                 intent.setData(uri);
-                activity.startActivity(intent);
+                try {
+                    activity.startActivity(intent);
+                } catch (Exception e) {
+                    FLog.warning("[OBB] app-specific files access settings unavailable, opening global settings: " + e.getMessage());
+                    activity.startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                }
             }
         } else {
             ActivityCompat.requestPermissions(activity, new String[]{
@@ -467,8 +562,11 @@ public class FileCopyTask {
     }
 
     public void copyObbFolderAsync(final String packageName, final CopyCallback callback) {
+        logStorageDiagnostics(packageName);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
             requestStoragePermission();
+            hideCopyAnimation(false, "Storage permission required. Enable All Files Access and retry.");
+            if (callback != null) callback.onCopyCompleted(false);
             return;
         }
 
@@ -501,8 +599,8 @@ public class FileCopyTask {
                 File rootStorage = Environment.getExternalStorageDirectory();
                 File sourceObbDir = new File(rootStorage, "Android/obb/" + packageName);
                 File sourceDataDir = new File(rootStorage, "Android/data/" + packageName);
-                File destObbDir = resolveWritableDir(getExternalObbDir(packageName), getFallbackObbDir(packageName), getSecondaryFallbackObbDir(packageName), "OBB", packageName);
-                File destDataDir = resolveWritableDir(getExternalDataDir(packageName), getFallbackDataDir(packageName), getSecondaryFallbackDataDir(packageName), "DATA", packageName);
+                File destObbDir = resolveWritableDir("OBB", packageName, getExternalObbDir(packageName), getFallbackObbDir(packageName), getSecondaryFallbackObbDir(packageName), getTertiaryFallbackObbDir(packageName));
+                File destDataDir = resolveWritableDir("DATA", packageName, getExternalDataDir(packageName), getFallbackDataDir(packageName), getSecondaryFallbackDataDir(packageName), getTertiaryFallbackDataDir(packageName));
 
                 if (destObbDir == null) {
                     errorMsg = "Destination OBB folder creation failed!";
