@@ -93,6 +93,11 @@ public class FileCopyTask {
         return new File(base, "Android/obb/" + packageName);
     }
 
+
+    private File getTertiaryFallbackObbDir(String packageName) {
+        return new File(activity.getCacheDir(), "virtual_storage/Android/obb/" + packageName);
+    }
+
     private File getFallbackDataDir(String packageName) {
         File base = new File(activity.getFilesDir(), "virtual_storage");
         return new File(base, "Android/data/" + packageName);
@@ -104,39 +109,68 @@ public class FileCopyTask {
         return new File(base, "Android/data/" + packageName);
     }
 
-    private boolean ensureDir(File dir) {
-        if (dir == null) return false;
-        if (dir.exists()) {
-            if (dir.isDirectory()) return true;
-            if (!dir.delete()) return false;
-        }
-        return dir.mkdirs();
+
+    private File getTertiaryFallbackDataDir(String packageName) {
+        return new File(activity.getCacheDir(), "virtual_storage/Android/data/" + packageName);
     }
 
-    private File resolveWritableDir(File primary, File fallback, File secondaryFallback, String type, String packageName) {
-        if (ensureDir(primary)) {
-            return primary;
+    private boolean ensureDir(File dir) {
+        if (dir == null) return false;
+        try {
+            if (dir.exists()) {
+                if (!dir.isDirectory()) {
+                    if (!dir.delete()) return false;
+                } else {
+                    ensureDirectoryPermissions(dir);
+                    return dir.canWrite();
+                }
+            }
+            boolean created = dir.mkdirs();
+            if (!created && !dir.exists()) {
+                return false;
+            }
+            ensureDirectoryPermissions(dir);
+            return dir.exists() && dir.isDirectory() && dir.canWrite();
+        } catch (SecurityException e) {
+            FLog.warning("[DIR] security exception path=" + dir.getAbsolutePath() + ", error=" + e.getMessage());
+            return false;
+        } catch (Throwable e) {
+            FLog.warning("[DIR] exception path=" + dir.getAbsolutePath() + ", error=" + e.getMessage());
+            return false;
         }
-        if (primary != null) {
-            FLog.warning("[" + type + "] primary dir create failed package=" + packageName + ", path=" + primary.getAbsolutePath());
-        }
+    }
 
-        if (ensureDir(fallback)) {
-            FLog.info("[" + type + "] using fallback dir package=" + packageName + ", path=" + fallback.getAbsolutePath());
-            return fallback;
+    private void ensureDirectoryPermissions(File dir) {
+        if (dir == null) return;
+        try {
+            dir.setReadable(true, false);
+            dir.setWritable(true, false);
+            dir.setExecutable(true, false);
+        } catch (SecurityException ignored) {
         }
-        if (fallback != null) {
-            FLog.warning("[" + type + "] fallback dir create failed package=" + packageName + ", path=" + fallback.getAbsolutePath());
-        }
+    }
 
-        if (ensureDir(secondaryFallback)) {
-            FLog.info("[" + type + "] using secondary fallback dir package=" + packageName + ", path=" + secondaryFallback.getAbsolutePath());
-            return secondaryFallback;
+    private File resolveWritableDir(String type, String packageName, File... candidates) {
+        for (int index = 0; index < candidates.length; index++) {
+            File candidate = candidates[index];
+            if (candidate == null) {
+                continue;
+            }
+            if (ensureDir(candidate)) {
+                if (index == 0) {
+                    FLog.info("[" + type + "] using primary dir package=" + packageName + ", path=" + candidate.getAbsolutePath());
+                } else {
+                    FLog.info("[" + type + "] using fallback #" + index + " package=" + packageName + ", path=" + candidate.getAbsolutePath());
+                }
+                return candidate;
+            }
+            if (index == 0) {
+                FLog.warning("[" + type + "] primary dir create failed package=" + packageName + ", path=" + candidate.getAbsolutePath());
+            } else {
+                FLog.warning("[" + type + "] fallback #" + index + " dir create failed package=" + packageName + ", path=" + candidate.getAbsolutePath());
+            }
         }
-        if (secondaryFallback != null) {
-            FLog.error("[" + type + "] secondary fallback dir create failed package=" + packageName + ", path=" + secondaryFallback.getAbsolutePath());
-        }
-
+        FLog.error("[" + type + "] all directory candidates failed package=" + packageName);
         return null;
     }
 
@@ -180,7 +214,12 @@ public class FileCopyTask {
                 Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
                 Uri uri = Uri.fromParts("package", activity.getPackageName(), null);
                 intent.setData(uri);
-                activity.startActivity(intent);
+                try {
+                    activity.startActivity(intent);
+                } catch (Exception e) {
+                    FLog.warning("[OBB] app-specific files access settings unavailable, opening global settings: " + e.getMessage());
+                    activity.startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                }
             }
         } else {
             ActivityCompat.requestPermissions(activity, new String[]{
@@ -501,8 +540,8 @@ public class FileCopyTask {
                 File rootStorage = Environment.getExternalStorageDirectory();
                 File sourceObbDir = new File(rootStorage, "Android/obb/" + packageName);
                 File sourceDataDir = new File(rootStorage, "Android/data/" + packageName);
-                File destObbDir = resolveWritableDir(getExternalObbDir(packageName), getFallbackObbDir(packageName), getSecondaryFallbackObbDir(packageName), "OBB", packageName);
-                File destDataDir = resolveWritableDir(getExternalDataDir(packageName), getFallbackDataDir(packageName), getSecondaryFallbackDataDir(packageName), "DATA", packageName);
+                File destObbDir = resolveWritableDir("OBB", packageName, getExternalObbDir(packageName), getFallbackObbDir(packageName), getSecondaryFallbackObbDir(packageName), getTertiaryFallbackObbDir(packageName));
+                File destDataDir = resolveWritableDir("DATA", packageName, getExternalDataDir(packageName), getFallbackDataDir(packageName), getSecondaryFallbackDataDir(packageName), getTertiaryFallbackDataDir(packageName));
 
                 if (destObbDir == null) {
                     errorMsg = "Destination OBB folder creation failed!";
